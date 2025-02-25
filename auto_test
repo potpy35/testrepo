@@ -4,9 +4,9 @@ import webbrowser
 import time
 
 ### STEP 1: Define Your Spotify Credentials ###
-CLIENT_ID = "your_spotify_client_id"
-CLIENT_SECRET = "your_spotify_client_secret"
-REDIRECT_URI = "your_redirect_uri"  # Must match the one registered in Spotify Developer
+CLIENT_ID = "0a6299e3a6b943d5b4b902116fd30c25"
+CLIENT_SECRET = "008f91c04cb64b23bc942491a4b978cc"
+REDIRECT_URI = "https://shortcuts.spotify-auth/callback" 
 
 TOKEN_FILE = "spotify_tokens.json"  # File to store tokens persistently
 
