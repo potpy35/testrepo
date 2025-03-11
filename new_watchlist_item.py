@@ -3,10 +3,10 @@ import sys
 import os
 from openpyxl import Workbook, load_workbook
 
-# TMDb API Key (Replace with your API Key)
-API_KEY = "your_tmdb_api_key"
+# TMDb API Key
+API_KEY = "4fb3b577e9c675bd408d6d22b4e8ed54"
 BASE_URL = "https://api.themoviedb.org/3"
-EXCEL_FILENAME = os.path.expanduser("~/Documents/movie_metadata.xlsx")  # File location on iOS (Pythonista)
+EXCEL_FILENAME = os.path.expanduser("~/Library/Mobile Documents/iCloud~com~omz-software~Pythonista3/Documents/Shortcut Automations/Watchlist/Watchlist.xlsx")  # File location on iOS (Pythonista)
 
 def get_movie_data(title):
     """Fetches movie or TV show metadata from TMDb API."""
@@ -83,10 +83,7 @@ def append_to_excel(data):
         workbook = load_workbook(EXCEL_FILENAME)
         sheet = workbook.active
     else:
-        # Create a new workbook and add headers
-        workbook = Workbook()
-        sheet = workbook.active
-        sheet.append(headers)
+        print("No watchlist file found.")
 
     # Append new data
     sheet.append(data)
