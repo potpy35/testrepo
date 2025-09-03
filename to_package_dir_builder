@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""
+Mirror/mark DP folders from an Excel list of part numbers.
+
+Given:
+  1) A SOURCE directory containing subfolders named like: "[DP#] - [PartNumber]"
+     e.g., "14-001 - 33D9-54-109"
+  2) An Excel file with a header row; first column contains PartNumber values.
+
+Creates, in DEST:
+  - If matches exist in SOURCE (by exact PartNumber match, case-insensitive):
+        Create a folder in DEST for each matching SOURCE folder name (verbatim).
+  - If no matches exist:
+        Create "<PartNumber> NOT FOUND" in DEST.
+
+Also writes a CSV report (unless --no-report).
+"""
+
+from __future__ import annotations
+import argparse
+import csv
+import re
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import pandas as pd  # pandas uses openpyxl under the hood for .xlsx
+
+SEP = " - "  # expected separator in source folder names
+
+
+def normalize_part(part: str) -> str:
+    """Normalize a part number for matching."""
+    return re.sub(r"\s+", "", str(part)).upper()
+
+
+def parse_source_directory(src: Path) -> Dict[str, List[str]]:
+    """
+    Scan SOURCE directory and build an index:
+      normalized_part_number -> [original_folder_name, ...]
+    Only subdirectories whose names contain ' - ' are considered.
+    """
+    index: Dict[str, List[str]] = {}
+    for p in sorted(src.iterdir()):
+        if not p.is_dir():
+            continue
+        name = p.name
+        if SEP not in name:
+            continue  # skip folders not following the "DP - PN" format
+        # Extract the part number as the substring after the last " - "
+        # (defensive in case the DP# itself contains ' - ')
+        try:
+            dp, part = name.rsplit(SEP, 1)
+        except ValueError:
+            continue
+        key = normalize_part(part)
+        index.setdefault(key, []).append(name)
+    return index
+
+
+def load_part_numbers(xlsx: Path, sheet: str | int | None, column: str | int | None) -> List[str]:
+    """
+    Load the first column (or specified column) AFTER the header from Excel.
+    Returns a list of non-empty strings (stripped).
+    """
+    if sheet is None:
+        df = pd.read_excel(xlsx, engine="openpyxl")
+    else:
+        df = pd.read_excel(xlsx, sheet_name=sheet, engine="openpyxl")
+
+    # Choose column
+    if column is None:
+        series = df.iloc[:, 0]
+    else:
+        series = df[column]
+
+    parts = []
+    for v in series.tolist():
+        if pd.isna(v):
+            continue
+        s = str(v).strip()
+        if s:
+            parts.append(s)
+    return parts
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def sanitize_folder_name(name: str) -> str:
+    """
+    Make a safe folder name across platforms.
+    Windows disallows <>:"/\\|?* and trailing spaces/dots; POSIX is tolerant but keep consistent.
+    """
+    # Replace forbidden characters with underscore
+    name = re.sub(r'[<>:"/\\|?*]', "_", name)
+    # Trim trailing spaces/dots
+    return name.rstrip(" .")
+
+
+def process(
+    source_dir: Path,
+    dest_dir: Path,
+    excel_path: Path,
+    sheet: str | int | None,
+    column: str | int | None,
+    dry_run: bool,
+    no_report: bool,
+    report_path: Path | None,
+) -> Tuple[int, int, int]:
+    """
+    Core workflow. Returns counts: (total_parts, matched_parts, created_folders)
+    """
+    index = parse_source_directory(source_dir)
+    parts = load_part_numbers(excel_path, sheet, column)
+
+    ensure_dir(dest_dir)
+
+    created = 0
+    matched_parts = 0
+
+    report_rows = []
+    for pn in parts:
+        key = normalize_part(pn)
+        matches = index.get(key, [])
+        if matches:
+            matched_parts += 1
+            for folder_name in matches:
+                out_name = sanitize_folder_name(folder_name)
+                out_path = dest_dir / out_name
+                if not dry_run:
+                    ensure_dir(out_path)
+                created += 1
+                report_rows.append(
+                    {"PartNumber": pn, "Status": "FOUND", "CreatedFolder": out_name}
+                )
+        else:
+            out_name = sanitize_folder_name(f"{pn} NOT FOUND")
+            out_path = dest_dir / out_name
+            if not dry_run:
+                ensure_dir(out_path)
+            created += 1
+            report_rows.append(
+                {"PartNumber": pn, "Status": "NOT_FOUND", "CreatedFolder": out_name}
+            )
+
+    # Write report
+    if not no_report:
+        if report_path is None:
+            report_path = dest_dir / "folder_creation_report.csv"
+        if not dry_run:
+            with report_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["PartNumber", "Status", "CreatedFolder"])
+                writer.writeheader()
+                writer.writerows(report_rows)
+
+    return len(parts), matched_parts, created
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Create destination folders based on Excel part numbers and source 'DP - PN' folders."
+    )
+    p.add_argument("--source-dir", required=True, type=Path, help="Directory with 'DP - PN' folders.")
+    p.add_argument("--excel", required=True, type=Path, help="Excel file with part numbers.")
+    p.add_argument("--dest-dir", required=True, type=Path, help="Destination directory to create folders in.")
+    p.add_argument("--sheet", default=None, help="Sheet name or index (default: first sheet).")
+    p.add_argument(
+        "--column",
+        default=None,
+        help="Excel column name or 0-based index containing part numbers (default: first column).",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Do everything except create folders or write report.")
+    p.add_argument("--no-report", action="store_true", help="Do not write the CSV report.")
+    p.add_argument("--report-path", type=Path, default=None, help="Optional explicit CSV report path.")
+    return p
+
+
+def main():
+    ap = build_argparser()
+    args = ap.parse_args()
+
+    sheet = None
+    if args.sheet is not None:
+        # try to parse as int; else leave as str
+        try:
+            sheet = int(args.sheet)
+        except ValueError:
+            sheet = args.sheet
+
+    column = None
+    if args.column is not None:
+        try:
+            column = int(args.column)
+        except ValueError:
+            column = args.column
+
+    total, matched, created = process(
+        source_dir=args.source_dir,
+        dest_dir=args.dest_dir,
+        excel_path=args.excel,
+        sheet=sheet,
+        column=column,
+        dry_run=args.dry_run,
+        no_report=args.no_report,
+        report_path=args.report_path,
+    )
+
+    print(f"Parts processed: {total}")
+    print(f"Parts with matches: {matched}")
+    print(f"Destination folders created (or would create with --dry-run): {created}")
+
+
+if __name__ == "__main__":
+    main()
