@@ -1,0 +1,203 @@
+from typing import List, Union, Any
+import time
+from pathlib import Path
+
+import datetime as dt
+
+from playwright.sync_api import sync_playwright, expect, Page
+import pandas as pd
+import re
+
+
+FILEPATH_PNs = r'C:\Users\harry.davis\OneDrive - BAE Systems Inc\Documents\PRD\ETIMS and AVCOM Automation\Maintenance Automation\Prelim_TO_Rev_Status.xlsx'
+PROPS = [
+    'Source Document Date',
+    'Source Document Revision',
+    'Source Document Revision Date'
+]
+
+
+def run_audit() -> List[dict[str, dict[str, str]]]:
+    with sync_playwright() as p:
+        # Use your real user data directory where Smart Card cert is trusted
+        browser = p.chromium.launch_persistent_context(
+            user_data_dir=r"C:\Users\harry.davis\AppData\Local\Google\Chrome\User Data\Default",
+            headless=False,  # or True once tested
+            args=["--ignore-certificate-errors"]
+        )
+        page = browser.new_page()
+        page.goto("https://prodbati.avcom.baesystems.us/bati")
+
+        page.wait_for_load_state("networkidle")
+        
+        # Dismiss "Accept" message box
+        try:
+            print("Attempting to clear initial message box")
+            page.wait_for_selector("button:has-text('I Agree')", timeout=10000)
+            page.click("button:has-text('I Agree')")
+            print("Clicked 'I Agree'")
+        except:
+            pass
+    
+        page.wait_for_load_state("networkidle")
+
+        pns = load_part_numbers(FILEPATH_PNs)
+
+        page.click("text=Search")
+        
+        results = []
+        results_locator = page.locator("#searchResultsListing tbody tr")
+
+        start_time = time.perf_counter()
+        for pn in pns:
+            page.wait_for_selector("#searchSearchOPN", timeout=5000)
+            page.fill("#searchSearchOPN", pn)
+            
+            page.click("text=Refresh")
+            page.wait_for_load_state("networkidle")
+            
+            # Handle 'No Matches' dialog box if it appears
+            dlg = page.get_by_role("dialog").filter(has_text=re.compile("no matches", re.IGNORECASE))
+            try:
+                dlg.wait_for(state='visible', timeout=2000)
+                print(f"No matches found for {pn}")
+                dlg.get_by_role("button", name="Ok").first.click()
+                no_matches_props = {p: "NO MATCHES" for p in PROPS}
+                results.append({pn: no_matches_props})
+                continue
+            except:
+                pass
+
+            # Initial search results table
+            tbody_search = page.locator("#searchResultsListingTB")
+            row_search = tbody_search.locator(f"tr:has(td:has-text('{pn}'))").first
+            target_cell = row_search.locator("td.avcom_selectableTD.sorting_1")
+            target_cell.click()
+
+            page.wait_for_load_state("networkidle")
+
+            # Secondary 'Select Specific Structure Location' table
+            tbody_structure = page.locator("#searchLocationsListingTB")
+            cell = tbody_structure.locator("td.avcom_selectableTD", has_text=pn).first
+            cell.click()
+
+            page.wait_for_load_state("networkidle")
+
+            # Click the 'Properties' tab
+            container = page.locator("#aggproTabs")
+            container.get_by_role('tab', name='Properties').click()
+            
+            # Get PROPS values
+            props_values = {p: get_prop_value(p, page) for p in PROPS}
+            print(props_values)
+
+            results.append({pn: props_values})
+            
+            page.click("text=Search")
+        
+        end_time = time.perf_counter()
+        print(f"\nPart search elapsed time: {round(end_time - start_time, 3)} seconds\n")
+
+        browser.close()
+    
+    # print(results)
+    return results
+
+
+def get_prop_value(prop_name: str, page: Page) -> str:
+    page.wait_for_load_state("networkidle")
+    # Find the row whose first <td> contains the property name
+    expect(page.locator("#aggproPropListingDiv")).to_be_visible
+    tbody = page.locator("#aggproPropListingTB")
+    row = tbody.locator(f"tr:has(td:has-text('{prop_name}'))").first
+    value_cell = row.locator("td").nth(1)
+    value_text = value_cell.inner_text()
+
+    return value_text
+
+
+def load_part_numbers(filepath: str) -> List[str]:
+    parts = pd.read_excel(filepath, sheet_name="From AVCOM", usecols=[0], dtype=str)
+    pn_series = parts.iloc[:, 0]
+    pn_list = pn_series.tolist()
+
+    return pn_list
+
+
+def map_source_doc_data(source_doc_data: List[dict[str, dict[str, str]]], output_path: Union[str, Path]) -> None:
+    """
+    Ingests list of nested dictionaries, flattens it, and constructs an Excel file from it.
+    """
+    rows: List[dict[str, Any]] = []
+
+    for idx, item in enumerate(source_doc_data):
+        to_num, payload = next(iter(item.items()))
+
+        date_val = payload.get("Source Document Date")
+        rev_val = payload.get("Source Document Revision")
+        rev_date_val = payload.get("Source Document Revision Date")
+
+        date_val = _to_date_safe(date_val)
+        rev_date_val = _to_date_safe(rev_date_val)
+
+        rows.append(
+            {
+                "TO#": to_num,
+                "Source Document Date": date_val,
+                "Source Document Revision": rev_val,
+                "Source Document Revision Date": rev_date_val
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    with pd.ExcelWriter(output_path, engine='xlsxwriter', datetime_format='yyyy-mm-dd') as writer:
+        df.to_excel(writer, index=False, sheet_name='AVCOM_Current_TOs')
+
+        # Freeze header row and add filters
+        ws = writer.sheets['AVCOM_Current_TOs']
+        nrows, ncols = df.shape
+        ws.freeze_panes(1,0)
+        ws.autofilter(0, 0, nrows, ncols - 1)
+
+        # Autosize columns to content width
+        for col_idx, col_name in enumerate(df.columns):
+            series = df[col_name].astype(str)
+            max_len = max([len(col_name)] + series.map(len).tolist())
+            ws.set_column(col_idx, col_idx, min(max_len + 2, 60))
+    
+    print(f"Output generated at: {output_path}")
+
+
+def _to_date_safe(value: Any) -> Any:
+    """
+    Converts str to datetime. Returns the original value if parsing
+    fails or if value is already datetime.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dt.date):
+        return value
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, str):
+        value = value.strip()
+        
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+            try:
+                return dt.datetime.strptime(value, fmt).date()
+            except ValueError:
+                continue
+        
+        # try pandas to_datetime as last resort
+        try:
+            return pd.to_datetime(value, errors="raise").date()
+        except Exception:
+            return value  # leave as original string if parsing fails
+    
+    return value
+
+
+if __name__ == "__main__":
+    OUTPUT_FILEPATH = r"C:\Users\harry.davis\OneDrive - BAE Systems Inc\Documents\PRD\ETIMS and AVCOM Automation\Maintenance Automation\Scripts_Output\AVCOM_Current_TOs.xlsx"
+    source_doc_data = run_audit()
+    map_source_doc_data(source_doc_data, OUTPUT_FILEPATH)
