@@ -1,0 +1,276 @@
+"Prelim_TO_Rev_Status" vs "AVCOM_Current_TOs" and
+# produce "Comparison_AVCOM_TOs.xlsx" containing the current-file columns plus a
+# final "Needs to be updated?" flag.
+#
+# Usage (CLI):
+#   python compare_avcom_tos.py \
+#     --prelim Prelim_TO_Rev_Status.xlsx \
+#     --current AVCOM_Current_TOs.xlsx \
+#     --out Comparison_AVCOM_TOs.xlsx
+#
+# Notes:
+# - Rows are matched on the `TO#` key.
+# - If a TO exists in the current file but not in the prelim file, it is flagged "Y".
+# - Date parsing is robust to mixed formats; invalid/missing dates are handled gracefully.
+# - Revision comparison attempts numeric extraction; falls back to string compare when needed.
+#
+# Dependencies:
+#   - pandas
+#   - openpyxl
+#
+# Author: ChatGPT (GPT-5 Thinking)
+
+from __future__ import annotations
+
+import argparse
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Tuple
+
+import pandas as pd
+
+
+# -------------------------- Utilities -------------------------- #
+
+def _parse_date(val) -> Optional[pd.Timestamp]:
+    """Parse a date-like value to pandas Timestamp; return None if not parseable.
+    Accepts strings, Excel serial dates (as floats/ints), or Timestamps."""
+    if pd.isna(val):
+        return None
+    try:
+        ts = pd.to_datetime(val, errors="coerce", dayfirst=False, infer_datetime_format=True)
+        if pd.isna(ts):
+            return None
+        # Normalize away timezone if present
+        return ts.tz_localize(None) if hasattr(ts, "tz_localize") else ts
+    except Exception:
+        return None
+
+
+_NUM_RE = re.compile(r"(\d+)")  # first integer group
+
+
+def _extract_int(val) -> Optional[int]:
+    """Try to extract the first integer substring from val (e.g., '03'->3, 'A.12'->12)."""
+    if pd.isna(val):
+        return None
+    s = str(val).strip()
+    m = _NUM_RE.search(s)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def _compare_dates(prelim, current) -> Optional[int]:
+    """Compare two date-like values.
+    Returns: +1 if current>prelim, 0 if equal, -1 if current<prelim, None if missing."""
+    d_pre = _parse_date(prelim)
+    d_cur = _parse_date(current)
+    if d_pre is None or d_cur is None:
+        return None
+    if d_cur > d_pre:
+        return +1
+    if d_cur < d_pre:
+        return -1
+    return 0
+
+
+def _compare_revisions(prelim, current) -> Optional[int]:
+    """Compare revisions. Prefer numeric comparison when both have a number.
+    Returns: +1 if current>prelim, 0 if equal, -1 if current<prelim, None if both missing."""
+    if pd.isna(prelim) and pd.isna(current):
+        return None
+
+    n_pre = _extract_int(prelim)
+    n_cur = _extract_int(current)
+
+    if n_pre is not None and n_cur is not None:
+        if n_cur > n_pre:
+            return +1
+        if n_cur < n_pre:
+            return -1
+        return 0
+
+    # Fallback to normalized string comparison
+    s_pre = "" if pd.isna(prelim) else str(prelim).strip().casefold()
+    s_cur = "" if pd.isna(current) else str(current).strip().casefold()
+    if s_cur > s_pre:
+        return +1
+    if s_cur < s_pre:
+        return -1
+    return 0
+
+
+# -------------------------- Core Classes -------------------------- #
+
+@dataclass
+class ColumnMap:
+    """Canonical column names used internally."""
+    key: str = "TO#"
+    prelim_date: str = "TO Rev"
+    prelim_revnum: str = "TO Chg#"
+    prelim_revdate: str = "TO Chg Date"
+
+    current_date: str = "Source Document Date"
+    current_revnum: str = "Source Document Revision"
+    current_revdate: str = "Source Document Revision Date"
+
+
+class TOComparator:
+    """Encapsulates the comparison logic between the preliminary tracking sheet and
+    the current AVCOM sheet, producing an annotated current sheet."""
+
+    def __init__(
+        self,
+        prelim_path: Path,
+        current_path: Path,
+        output_path: Path,
+        sheet_prelim: Optional[str] = None,
+        sheet_current: Optional[str] = None,
+        colmap: ColumnMap = ColumnMap(),
+    ):
+        self.prelim_path = Path(prelim_path)
+        self.current_path = Path(current_path)
+        self.output_path = Path(output_path)
+        self.sheet_prelim = sheet_prelim
+        self.sheet_current = sheet_current
+        self.cm = colmap
+        self.current_columns_order = None  # set in _prepare
+
+    def _load(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        pkw = {"sheet_name": self.sheet_prelim} if self.sheet_prelim else {}
+        ckw = {"sheet_name": self.sheet_current} if self.sheet_current else {}
+        df_pre = pd.read_excel(self.prelim_path, engine="openpyxl", **pkw)
+        df_cur = pd.read_excel(self.current_path, engine="openpyxl", **ckw)
+
+        # Ensure required columns exist
+        for req in [self.cm.key, self.cm.prelim_date, self.cm.prelim_revnum, self.cm.prelim_revdate]:
+            if req not in df_pre.columns:
+                raise KeyError(f"Prelim file missing required column: '{req}'")
+        for req in [self.cm.key, self.cm.current_date, self.cm.current_revnum, self.cm.current_revdate]:
+            if req not in df_cur.columns:
+                raise KeyError(f"Current file missing required column: '{req}'")
+
+        return df_pre, df_cur
+
+    def _prepare(self, df_pre: pd.DataFrame, df_cur: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        df_pre = df_pre.copy()
+        df_cur = df_cur.copy()
+
+        df_pre[self.cm.key] = df_pre[self.cm.key].astype(str).str.strip()
+        df_cur[self.cm.key] = df_cur[self.cm.key].astype(str).str.strip()
+
+        # Keep only needed prelim columns
+        df_pre = df_pre[[self.cm.key, self.cm.prelim_date, self.cm.prelim_revnum, self.cm.prelim_revdate]]
+        # Remember the current file's primary columns order (we'll append the flag at the end)
+        self.current_columns_order = [self.cm.key, self.cm.current_date, self.cm.current_revnum, self.cm.current_revdate]
+        return df_pre, df_cur
+
+    def _compare_row(self, row_cur: pd.Series, row_prelim: Optional[pd.Series]) -> str:
+        """Decision logic returning 'Y' or 'N' per spec.
+
+        1) If all three pairs match exactly -> 'N'
+        2) Else:
+            - If Source Document Date is more recent than TO Rev -> 'Y'
+            - If dates equal but Source Document Revision is higher -> 'Y'
+            - If dates & revisions equal but Source Document Revision Date is more recent -> 'Y'
+        Otherwise default to 'Y' when mismatched/inconclusive to be conservative.
+        If prelim row is missing -> 'Y'
+        """
+        if row_prelim is None or row_prelim.empty:
+            return "Y"
+
+        # Raw values
+        pre_date = row_prelim[self.cm.prelim_date]
+        pre_revnum = row_prelim[self.cm.prelim_revnum]
+        pre_revdate = row_prelim[self.cm.prelim_revdate]
+
+        cur_date = row_cur[self.cm.current_date]
+        cur_revnum = row_cur[self.cm.current_revnum]
+        cur_revdate = row_cur[self.cm.current_revdate]
+
+        dates_equal = _compare_dates(pre_date, cur_date) == 0
+        rev_equal = _compare_revisions(pre_revnum, cur_revnum) == 0
+
+        revdates_cmp = _compare_dates(pre_revdate, cur_revdate)
+        revdates_equal = (revdates_cmp == 0)
+
+        if dates_equal and rev_equal and revdates_equal:
+            return "N"
+
+        dates_cmp = _compare_dates(pre_date, cur_date)
+        if dates_cmp == +1:
+            return "Y"
+
+        if dates_equal:
+            rev_cmp = _compare_revisions(pre_revnum, cur_revnum)
+            if rev_cmp == +1:
+                return "Y"
+            if rev_equal and revdates_cmp == +1:
+                return "Y"
+
+        return "Y"
+
+    def run(self) -> pd.DataFrame:
+        df_pre, df_cur = self._load()
+        df_pre, df_cur = self._prepare(df_pre, df_cur)
+
+        # Lookup prelim rows by TO#
+        pre_lookup = df_pre.set_index(self.cm.key)
+
+        flags = []
+        for _, row in df_cur.iterrows():
+            key = str(row[self.cm.key]).strip()
+            row_pre = None
+            if key in pre_lookup.index:
+                row_pre = pre_lookup.loc[key]
+                if isinstance(row_pre, pd.DataFrame):
+                    row_pre = row_pre.iloc[-1]
+            flags.append(self._compare_row(row, row_pre))
+
+        df_out = df_cur.copy()
+        df_out["Needs to be updated?"] = flags
+
+        # Ensure the flag is the last column
+        cols = list(df_out.columns)
+        if "Needs to be updated?" in cols:
+            cols = [c for c in cols if c != "Needs to be updated?"] + ["Needs to be updated?"]
+            df_out = df_out[cols]
+
+        # Write Excel
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        df_out.to_excel(self.output_path, index=False, engine="openpyxl")
+        return df_out
+
+
+# -------------------------- CLI -------------------------- #
+
+def _build_argparser():
+    p = argparse.ArgumentParser(description="Compare AVCOM TOs and flag updates.")
+    p.add_argument("--prelim", required=True, help="Path to Prelim_TO_Rev_Status.xlsx")
+    p.add_argument("--current", required=True, help="Path to AVCOM_Current_TOs.xlsx")
+    p.add_argument("--out", default="Comparison_AVCOM_TOs.xlsx", help="Output Excel path")
+    p.add_argument("--sheet-prelim", default=None, help="Sheet name in prelim file (optional)")
+    p.add_argument("--sheet-current", default=None, help="Sheet name in current file (optional)")
+    return p
+
+
+def main():
+    args = _build_argparser().parse_args()
+    comparator = TOComparator(
+        prelim_path=Path(args.prelim),
+        current_path=Path(args.current),
+        output_path=Path(args.out),
+        sheet_prelim=args.sheet_prelim,
+        sheet_current=args.sheet_current,
+    )
+    df = comparator.run()
+    print(f"â Wrote: {Path(args.out).resolve()}  ({len(df)} rows)")
+
+
+if __name__ == "__main__":
+    main()
